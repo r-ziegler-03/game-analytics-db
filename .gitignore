@@ -4,3 +4,5 @@ session-summaries/
 .claude/
 CLAUDE.md
 resume_draft.md
+venv/
+__pycache__/
