@@ -1,3 +1,5 @@
+import csv
+import io
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -5,6 +7,7 @@ import psycopg2
 from faker import Faker
 
 from collections import Counter
+from psycopg2.extras import execute_values
 
 fake = Faker()
 
@@ -60,6 +63,9 @@ MODE_PARAMS = {
 }
 MODES = list(MODE_PARAMS.keys())
 
+AVG_PRIMARY_GAP = 5  # average gap in seconds between primary ability uses
+SECONDARY_USE_PROBABILITY = 0.7  # probability of using a secondary ability when available
+
 def get_connection():
     return psycopg2.connect(dbname=DB_NAME)
 
@@ -86,17 +92,75 @@ def load_abilities_by_hero(conn):
             weight = 0.025  # flat: rare but disproportionately likely to secure a kill when used
         else:
             weight = 1 / (cooldown_seconds + 5)
-        abilities_by_hero.setdefault(hero_id, []).append((ability_id, weight))
+        abilities_by_hero.setdefault(hero_id, []).append({
+            "ability_id": ability_id,
+            "weight": weight,
+            "ability_type": ability_type,
+            "cooldown_seconds": cooldown_seconds,
+        })
     return abilities_by_hero
+
+def copy_events(cur, event_rows):
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerows(event_rows)
+    buffer.seek(0)
+    cur.copy_expert(
+        "COPY events (actor_session_id, target_session_id, event_type, ability_id, event_timestamp) FROM STDIN WITH (FORMAT csv)",
+        buffer,
+    )
 
 def pick_killing_ability(opposing_team_heroes, abilities_by_hero):
     candidates = []
     weights = []
     for hero_id in opposing_team_heroes:
-        for ability_id, weight in abilities_by_hero[hero_id]:
-            candidates.append((hero_id, ability_id))
-            weights.append(weight)
+        for entry in abilities_by_hero[hero_id]:
+            candidates.append((hero_id, entry["ability_id"]))
+            weights.append(entry["weight"])
     return random.choices(candidates, weights=weights, k=1)[0]
+
+def generate_ability_events(participants, abilities_by_hero, heroes_by_role, event_rows):
+    hero_id_to_role = {
+        hero_id: role
+        for role, hero_ids in heroes_by_role.items()
+        for hero_id in hero_ids
+    }
+
+    def record_ability_event(participant, session, entry, current_time):
+        actor_role = hero_id_to_role[session["hero_id"]]
+        if actor_role == "Support":
+            pool = [p for p in participants if p["did_win"] == participant["did_win"] and p is not participant and get_current_hero(p, current_time) is not None]
+        else:
+            pool = [p for p in participants if p["did_win"] != participant["did_win"] and get_current_hero(p, current_time) is not None]
+        target = random.choice(pool) if pool else None
+        target_session_id = None
+        if target is not None:
+            target_session_id = next(
+                s["session_id"] for s in target["sessions"]
+                if s["started_at"] <= current_time <= s["ended_at"]
+            )
+        event_type = "ultimate_used" if entry["ability_type"] == "Ultimate" else "ability_used"
+        event_rows.append((session["session_id"], target_session_id, event_type, entry["ability_id"], current_time))
+
+    for participant in participants:
+        for session in participant["sessions"]:
+            hero_id = session["hero_id"]
+            for entry in abilities_by_hero[hero_id]:
+                if entry["ability_type"] == "Primary" or entry["cooldown_seconds"] == 0:
+                    current_time = session["started_at"]
+                    while True:
+                        current_time += timedelta(seconds=random.expovariate(1 / AVG_PRIMARY_GAP))
+                        if current_time >= session["ended_at"]:
+                            break
+                        record_ability_event(participant, session, entry, current_time)
+                else:
+                    current_time = session["started_at"]
+                    while True:
+                        current_time += timedelta(seconds=entry["cooldown_seconds"])
+                        if current_time >= session["ended_at"]:
+                            break
+                        if random.random() < SECONDARY_USE_PROBABILITY:
+                            record_ability_event(participant, session, entry, current_time)
 
 def simulate_participant_life(starting_hero_id, match_start, match_length_seconds, opposing_team_heroes, abilities_by_hero, all_hero_ids):
     match_end = match_start + timedelta(seconds=match_length_seconds)
@@ -193,8 +257,8 @@ def resolve_kill_events(participants, abilities_by_hero):
                 actor = random.choice(active)
                 actor_hero_id = get_current_hero(actor, timestamp)
                 candidates = abilities_by_hero[actor_hero_id]
-                ability_ids = [a[0] for a in candidates]
-                weights = [a[1] for a in candidates]
+                ability_ids = [entry["ability_id"] for entry in candidates]
+                weights = [entry["weight"] for entry in candidates]
                 actor_ability_id = random.choices(ability_ids, weights=weights, k=1)[0]
 
             resolved.append({
@@ -349,31 +413,51 @@ def insert_full_match(conn, group, heroes_by_role, abilities_by_hero, all_hero_i
 
     participants = simulate_match_participants(group, heroes_by_role, abilities_by_hero, all_hero_ids, match_length_seconds)
 
-    for participant in participants:
-        cur.execute(
-            """
-            INSERT INTO match_participants (match_id, player_id, did_win, left_early, rank_before_match, rank_after_match)
-            VALUES (%s, %s, %s, %s, NULL, NULL)
-            RETURNING participant_id
-            """,
-            (match_id, participant["player_id"], participant["did_win"], participant["left_early"]),
-        )
-        participant["participant_id"] = cur.fetchone()[0]
+    match_participant_values = [
+        {
+            "match_id": match_id,
+            "player_id": p["player_id"],
+            "did_win": p["did_win"],
+            "left_early": p["left_early"],
+        }
+        for p in participants
+    ]
+    match_participant_results = execute_values(
+        cur,
+        "INSERT INTO match_participants (match_id, player_id, did_win, left_early, rank_before_match, rank_after_match) VALUES %s RETURNING participant_id",
+        match_participant_values,
+        template="(%(match_id)s, %(player_id)s, %(did_win)s, %(left_early)s, NULL, NULL)",
+        fetch=True,
+    )
+    for participant, (participant_id,) in zip(participants, match_participant_results):
+        participant["participant_id"] = participant_id
 
+    session_values = []
+    session_refs = []
+    for participant in participants:
         for session in participant["sessions"]:
-            cur.execute(
-                """
-                INSERT INTO participant_heroes (participant_id, hero_id, started_at, ended_at, damage_done, healing_done, eliminations, deaths, assists, number_of_ultimates_used)
-                VALUES (%s, %s, %s, %s, 0, 0, 0, 0, 0, 0)
-                RETURNING session_id
-                """,
-                (participant["participant_id"], session["hero_id"], session["started_at"], session["ended_at"]),
-            )
-            session["session_id"] = cur.fetchone()[0]
+            session_values.append({
+                "participant_id": participant["participant_id"],
+                "hero_id": session["hero_id"],
+                "started_at": session["started_at"],
+                "ended_at": session["ended_at"],
+            })
+            session_refs.append(session)
+
+    session_results = execute_values(
+        cur,
+        "INSERT INTO participant_heroes (participant_id, hero_id, started_at, ended_at, damage_done, healing_done, eliminations, deaths, assists, number_of_ultimates_used) VALUES %s RETURNING session_id",
+        session_values,
+        template="(%(participant_id)s, %(hero_id)s, %(started_at)s, %(ended_at)s, 0, 0, 0, 0, 0, 0)",
+        fetch=True,
+    )
+    for session, (session_id,) in zip(session_refs, session_results):
+        session["session_id"] = session_id
 
     resolved = resolve_kill_events(participants, abilities_by_hero)
     by_player = {p["player_id"]: p for p in participants}
 
+    event_rows = []
     for kill in resolved:
         if kill["actor_player_id"] is None:
             continue  # rare edge case, no valid opposing killer -- skip for now
@@ -386,16 +470,14 @@ def insert_full_match(conn, group, heroes_by_role, abilities_by_hero, all_hero_i
         victim_session_id = next(s["session_id"] for s in victim["sessions"] if s["hero_id"] == victim_hero and s["started_at"] <= kill["timestamp"] <= s["ended_at"])
         actor_session_id = next(s["session_id"] for s in actor["sessions"] if s["hero_id"] == actor_hero and s["started_at"] <= kill["timestamp"] <= s["ended_at"])
 
-        cur.execute(
-            "INSERT INTO events (actor_session_id, target_session_id, event_type, ability_id, event_timestamp) VALUES (%s, %s, 'kill', %s, %s)",
-            (actor_session_id, victim_session_id, kill["ability_id"], kill["timestamp"]),
-        )
-        cur.execute(
-            "INSERT INTO events (actor_session_id, target_session_id, event_type, ability_id, event_timestamp) VALUES (%s, %s, 'death', %s, %s)",
-            (victim_session_id, actor_session_id, kill["ability_id"], kill["timestamp"]),
-        )
+        event_rows.append((actor_session_id, victim_session_id, "kill", kill["ability_id"], kill["timestamp"]))
+        event_rows.append((victim_session_id, actor_session_id, "death", kill["ability_id"], kill["timestamp"]))
 
+    generate_ability_events(participants, abilities_by_hero, heroes_by_role, event_rows)
+    copy_events(cur, event_rows)
     return match_id
+
+
 
 def main():
     conn = get_connection()
