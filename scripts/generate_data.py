@@ -384,11 +384,26 @@ def generate_matches(conn, players_data, heroes_by_role, abilities_by_hero, all_
         remaining = leftover
 
     print(f"total timestamps: {len(all_timestamps)}, full match groups: {len(match_groups)}, unused leftover: {len(remaining)}")
+
+    last_played_by_player = {}
+    for group in match_groups:
+        for timestamp, player_id in group:
+            if player_id not in last_played_by_player or timestamp > last_played_by_player[player_id]:
+                last_played_by_player[player_id] = timestamp
+
     match_ids = []
     for group in match_groups:
         match_id = insert_full_match(conn, group, heroes_by_role, abilities_by_hero, all_hero_ids)
         match_ids.append(match_id)
     print(f"Inserted {len(match_ids)} matches into the database.")
+
+    cur = conn.cursor()
+    execute_values(
+        cur,
+        "UPDATE players SET last_played = data.last_played FROM (VALUES %s) AS data (player_id, last_played) WHERE players.player_id = data.player_id",
+        list(last_played_by_player.items()),
+    )
+
     return match_ids
 
 def insert_full_match(conn, group, heroes_by_role, abilities_by_hero, all_hero_ids):

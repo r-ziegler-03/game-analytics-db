@@ -64,3 +64,10 @@ CREATE TABLE events (
     ability_id INT REFERENCES abilities(ability_id) ON DELETE SET NULL,
     event_timestamp TIMESTAMPTZ NOT NULL
 );
+
+-- actor_session_id first: queries filter to one session's events, then narrow by event_type
+CREATE INDEX idx_events_actor_type ON events (actor_session_id, event_type);
+
+-- target_session_id first: assists lookup filters to one victim's incoming events,
+-- then narrows by event_type and a timestamp range
+CREATE INDEX idx_events_target_type_timestamp ON events (target_session_id, event_type, event_timestamp);
