@@ -7,7 +7,7 @@ import psycopg2
 from faker import Faker
 
 from collections import Counter
-from psycopg2.extras import execute_values
+from psycopg2.extras import execute_values 
 
 fake = Faker()
 
@@ -479,31 +479,40 @@ def insert_full_match(conn, group, heroes_by_role, abilities_by_hero, all_hero_i
 
 
 
-def main():
+def main(commit=False):
     conn = get_connection()
     try:
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE events DROP CONSTRAINT events_ability_id_fkey")
+        cur.execute("ALTER TABLE events DROP CONSTRAINT events_actor_session_id_fkey")
+        cur.execute("ALTER TABLE events DROP CONSTRAINT events_target_session_id_fkey")
+        cur.execute("ALTER TABLE match_participants DROP CONSTRAINT match_participants_match_id_fkey")
+        cur.execute("ALTER TABLE match_participants DROP CONSTRAINT match_participants_player_id_fkey")
+        cur.execute("ALTER TABLE participant_heroes DROP CONSTRAINT participant_heroes_hero_id_fkey")
+        cur.execute("ALTER TABLE participant_heroes DROP CONSTRAINT participant_heroes_participant_id_fkey")
+
         heroes_by_role = load_heroes_by_role(conn)
         abilities_by_hero = load_abilities_by_hero(conn)
         all_hero_ids = [h for ids in heroes_by_role.values() for h in ids]
 
         players_data = generate_players(conn, NUM_PLAYERS)
         match_ids = generate_matches(conn, players_data, heroes_by_role, abilities_by_hero, all_hero_ids)
-        conn.commit()
+
+        cur.execute("ALTER TABLE events ADD CONSTRAINT events_ability_id_fkey FOREIGN KEY (ability_id) REFERENCES abilities(ability_id) ON DELETE SET NULL")
+        cur.execute("ALTER TABLE events ADD CONSTRAINT events_actor_session_id_fkey FOREIGN KEY (actor_session_id) REFERENCES participant_heroes(session_id) ON DELETE CASCADE")
+        cur.execute("ALTER TABLE events ADD CONSTRAINT events_target_session_id_fkey FOREIGN KEY (target_session_id) REFERENCES participant_heroes(session_id) ON DELETE SET NULL")
+        cur.execute("ALTER TABLE match_participants ADD CONSTRAINT match_participants_match_id_fkey FOREIGN KEY (match_id) REFERENCES matches(match_id) ON DELETE CASCADE")
+        cur.execute("ALTER TABLE match_participants ADD CONSTRAINT match_participants_player_id_fkey FOREIGN KEY (player_id) REFERENCES players(player_id) ON DELETE CASCADE")
+        cur.execute("ALTER TABLE participant_heroes ADD CONSTRAINT participant_heroes_hero_id_fkey FOREIGN KEY (hero_id) REFERENCES heroes(hero_id) ON DELETE CASCADE")
+        cur.execute("ALTER TABLE participant_heroes ADD CONSTRAINT participant_heroes_participant_id_fkey FOREIGN KEY (participant_id) REFERENCES match_participants(participant_id) ON DELETE CASCADE")
+
+        if commit:
+            conn.commit()
+        else:
+            conn.rollback()
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    conn = get_connection()
-    try:
-        heroes_by_role = load_heroes_by_role(conn)
-        abilities_by_hero = load_abilities_by_hero(conn)
-        all_hero_ids = [h for ids in heroes_by_role.values() for h in ids]
-
-        players_data = generate_players(conn, NUM_PLAYERS)
-        match_ids = generate_matches(conn, players_data, heroes_by_role, abilities_by_hero, all_hero_ids)
-        print(players_data[:5])  # Print first 5 players for verification
-        conn.rollback()
-    finally:
-        conn.close()
-    #main()
+    main(commit=False)
