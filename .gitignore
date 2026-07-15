@@ -6,3 +6,4 @@ CLAUDE.md
 resume_draft.md
 venv/
 __pycache__/
+.DS_Store
