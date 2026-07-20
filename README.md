@@ -1,6 +1,6 @@
 # Game Analytics DB
 
-A PostgreSQL analytics database for Overwatch-style match data — schema design, a synthetic
+A PostgreSQL analytics database for Overwatch-style match data: schema design, a synthetic
 data generator with a deliberately planted behavioral hypothesis, and analytical SQL
 (window functions, CTEs, joins) to test it.
 
@@ -8,9 +8,9 @@ As an avid gamer that enjoys playing Overwatch, I wanted to mesh my gaming love 
 
 ## Tech stack
 
-- **PostgreSQL** — schema, indexing, analytical SQL
-- **Python** (psycopg2, Faker) — synthetic data generation
-- No frameworks, no ORM — raw SQL throughout, by design
+- **PostgreSQL** schema, indexing, analytical SQL
+- **Python** (psycopg2, Faker) synthetic data generation
+- No frameworks, no ORM, raw SQL throughout, by design
 
 ## Schema
 
